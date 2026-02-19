@@ -37,10 +37,14 @@ import io.trino.plugin.deltalake.metastore.DeltaLakeMetastoreModule;
 import io.trino.plugin.deltalake.metastore.HiveMetastoreBackedDeltaLakeMetastore;
 import io.trino.plugin.deltalake.transactionlog.MetadataEntry;
 import io.trino.plugin.deltalake.transactionlog.ProtocolEntry;
+import io.trino.plugin.deltalake.transactionlog.TransactionLogAccess;
+import io.trino.plugin.hive.parquet.ParquetReaderConfig;
+import io.trino.plugin.hive.parquet.ParquetWriterConfig;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.Assignment;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
+import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableHandle;
 import io.trino.spi.connector.ConnectorTableLayout;
 import io.trino.spi.connector.ConnectorTableMetadata;
@@ -59,6 +63,7 @@ import io.trino.spi.type.RowType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
 import io.trino.testing.TestingConnectorContext;
+import io.trino.testing.TestingConnectorSession;
 import io.trino.tests.BogusType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -68,6 +73,8 @@ import org.junit.jupiter.api.parallel.Execution;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -81,9 +88,13 @@ import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
 import static io.airlift.testing.Closeables.closeAll;
 import static io.trino.plugin.deltalake.DeltaLakeColumnType.REGULAR;
+import static io.trino.plugin.deltalake.DeltaLakeErrorCode.DELTA_LAKE_INVALID_SCHEMA;
+import static io.trino.plugin.deltalake.DeltaLakeTableProperties.CHANGE_DATA_FEED_ENABLED_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.COLUMN_MAPPING_MODE_PROPERTY;
+import static io.trino.plugin.deltalake.DeltaLakeTableProperties.LOCATION_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaLakeTableProperties.PARTITIONED_BY_PROPERTY;
 import static io.trino.plugin.deltalake.DeltaTestingConnectorSession.SESSION;
+import static io.trino.plugin.deltalake.transactionlog.MetadataEntry.DELTA_CHANGE_DATA_FEED_ENABLED_PROPERTY;
 import static io.trino.plugin.hive.HiveTestUtils.HDFS_ENVIRONMENT;
 import static io.trino.plugin.hive.HiveTestUtils.HDFS_FILE_SYSTEM_STATS;
 import static io.trino.spi.connector.SaveMode.FAIL;
@@ -171,6 +182,7 @@ public class TestDeltaLakeMetadata
 
     private File temporaryCatalogDirectory;
     private DeltaLakeMetadataFactory deltaLakeMetadataFactory;
+    private TransactionLogAccess transactionLogAccess;
 
     @BeforeAll
     public void setUp()
@@ -191,6 +203,7 @@ public class TestDeltaLakeMetadata
                 new DeltaLakeSecurityModule(),
                 new DeltaLakeMetastoreModule(),
                 new DeltaLakeModule(),
+                new TestingDeltaLakeExtensionsModule(),
                 // test setup
                 binder -> {
                     binder.bind(HdfsEnvironment.class).toInstance(HDFS_ENVIRONMENT);
@@ -213,6 +226,7 @@ public class TestDeltaLakeMetadata
                 .initialize();
 
         deltaLakeMetadataFactory = injector.getInstance(DeltaLakeMetadataFactory.class);
+        transactionLogAccess = injector.getInstance(TransactionLogAccess.class);
 
         injector.getInstance(DeltaLakeMetastore.class)
                 .createDatabase(Database.builder()
@@ -482,6 +496,228 @@ public class TestDeltaLakeMetadata
         DeltaLakeTableHandle tableHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(SESSION, tableMetadata.getTable(), Optional.empty(), Optional.empty());
         assertThat(deltaLakeMetadata.getInfo(SESSION, tableHandle)).isEqualTo(Optional.of(new DeltaLakeInputInfo(false, 0)));
         deltaLakeMetadata.cleanupQuery(SESSION);
+    }
+
+    @Test
+    public void testGetTableHandleUsesSyntheticChecksumMetadataWhenPresent()
+            throws Exception
+    {
+        ConnectorSession loadMetadataFromChecksumFileEnabledSession = loadMetadataFromChecksumFileSession(true);
+        DeltaLakeMetadata deltaLakeMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        ConnectorTableMetadata tableMetadata = newTableMetadata(
+                ImmutableList.of(BIGINT_COLUMN_1, BIGINT_COLUMN_2),
+                ImmutableList.of());
+        deltaLakeMetadata.createTable(loadMetadataFromChecksumFileEnabledSession, tableMetadata, FAIL);
+        DeltaLakeTableHandle initialHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        String tableLocation = initialHandle.getLocation();
+        deltaLakeMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+
+        String syntheticSchemaString = String.join("",
+                "{\"type\":\"struct\",\"fields\":[",
+                "{\"name\":\"bigint_column1\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},",
+                "{\"name\":\"bigint_column2\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},",
+                "{\"name\":\"checksum_only_column\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}",
+                "]}");
+
+        // At this time, Trino doens't actually support writing checksum files for Delta tables. Write a synethetic/dummy
+        // checksum file to ensure that Delta checksum loading and parsing are exercised in tests. This can be removed once
+        // Trino supports writing checksum files
+        //
+        // Additionally, include a dummy checksum_only_column in the checksum metadata. This is invalid per the Delta spec,
+        // but it makes it easy to validate that we are loading the metadata from the checksum rather than the commit log
+        writeChecksumFile(tableLocation, 0, """
+                {
+                  "metadata": {
+                    "id": "synthetic-checksum-id",
+                    "name": null,
+                    "description": null,
+                    "format": {
+                      "provider": "parquet",
+                      "options": {}
+                    },
+                    "schemaString": "%s",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 0
+                  },
+                  "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                  }
+                }
+                """.formatted(syntheticSchemaString.replace("\"", "\\\"")));
+
+        DeltaLakeMetadata checksumMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        LocatedTableHandle checksumHandle = checksumMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        assertThat(checksumHandle).isInstanceOf(DeltaLakeTableHandle.class);
+
+        // Validate the presence of checksum_only_column
+        assertThat(((DeltaLakeTableHandle) checksumHandle).getMetadataEntry().getSchemaString()).contains("checksum_only_column");
+        checksumMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+    }
+
+    @Test
+    public void testGetTableHandleFallsBackWhenChecksumFileIsMissing()
+            throws Exception
+    {
+        DeltaLakeMetadata deltaLakeMetadata = deltaLakeMetadataFactory.create(SESSION.getIdentity());
+        ConnectorTableMetadata tableMetadata = newTableMetadata(
+                ImmutableList.of(BIGINT_COLUMN_1, BIGINT_COLUMN_2),
+                ImmutableList.of());
+        deltaLakeMetadata.createTable(SESSION, tableMetadata, FAIL);
+        DeltaLakeTableHandle initialHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(SESSION, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        String tableLocation = initialHandle.getLocation();
+        deltaLakeMetadata.cleanupQuery(SESSION);
+
+        Files.deleteIfExists(checksumFilePath(tableLocation, 0));
+
+        DeltaLakeMetadata fallbackMetadata = deltaLakeMetadataFactory.create(SESSION.getIdentity());
+        assertThat(fallbackMetadata.getTableHandle(SESSION, tableMetadata.getTable(), Optional.empty(), Optional.empty()))
+                .isInstanceOf(DeltaLakeTableHandle.class);
+        fallbackMetadata.cleanupQuery(SESSION);
+
+        // Sanity check: corrupt the actual commit file and verify that loading now fails -- proving that we did load from
+        // the Delta log rather than from a checksum
+        Path commitFilePath = Path.of(tableLocation).resolve("_delta_log").resolve("%020d.json".formatted(0));
+        Files.writeString(commitFilePath, "}");
+        transactionLogAccess.invalidateCache(tableMetadata.getTable(), Optional.of(tableLocation));
+        DeltaLakeMetadata corruptedLogMetadata = deltaLakeMetadataFactory.create(SESSION.getIdentity());
+        LocatedTableHandle corruptedLogHandle = corruptedLogMetadata.getTableHandle(SESSION, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        assertThat(corruptedLogHandle).isInstanceOf(CorruptedDeltaLakeTableHandle.class);
+        assertThat(((CorruptedDeltaLakeTableHandle) corruptedLogHandle).originalException())
+                .isInstanceOfSatisfying(TrinoException.class, exception ->
+                        assertThat(exception.getErrorCode()).isEqualTo(DELTA_LAKE_INVALID_SCHEMA.toErrorCode()));
+        corruptedLogMetadata.cleanupQuery(SESSION);
+    }
+
+    @Test
+    public void testGetTableHandleDoesNotUseOldCheckpointFile()
+            throws Exception
+    {
+        ConnectorSession loadMetadataFromChecksumFileEnabledSession = loadMetadataFromChecksumFileSession(true);
+        DeltaLakeMetadata deltaLakeMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        ConnectorTableMetadata tableMetadata = new ConnectorTableMetadata(
+                newMockSchemaTableName(),
+                ImmutableList.of(BIGINT_COLUMN_1, BIGINT_COLUMN_2),
+                ImmutableMap.of(
+                        LOCATION_PROPERTY,
+                        // Note: need a file:// URI for setTableTableProperties
+                        temporaryCatalogDirectory.toPath().resolve("table-" + UUID.randomUUID()).toUri().toString(),
+                        PARTITIONED_BY_PROPERTY,
+                        ImmutableList.of(),
+                        COLUMN_MAPPING_MODE_PROPERTY,
+                        "none"));
+        deltaLakeMetadata.createTable(loadMetadataFromChecksumFileEnabledSession, tableMetadata, FAIL);
+        DeltaLakeTableHandle initialHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        String tableLocation = initialHandle.getLocation().replaceFirst("^file://", "");
+
+        // At this time, Trino doens't actually support writing checksum files for Delta tables. Write a synethetic/dummy
+        // checksum file
+        writeChecksumFile(tableLocation, 0, """
+                {
+                  "metadata": {
+                    "id": "synthetic-checksum-id",
+                    "name": null,
+                    "description": null,
+                    "format": {
+                      "provider": "parquet",
+                      "options": {}
+                    },
+                    "schemaString": "%s",
+                    "partitionColumns": [],
+                    "configuration": {
+                      "%s": "false"
+                    },
+                    "createdTime": 0
+                  },
+                  "protocol": {
+                    "minReaderVersion": %d,
+                    "minWriterVersion": %d
+                  }
+                }
+                """.formatted(
+                initialHandle.getMetadataEntry().getSchemaString().replace("\"", "\\\""),
+                DELTA_CHANGE_DATA_FEED_ENABLED_PROPERTY,
+                initialHandle.getProtocolEntry().minReaderVersion(),
+                initialHandle.getProtocolEntry().minWriterVersion()));
+
+        // Evolve metadata to version 1 using a supported write-path operation.
+        deltaLakeMetadata.setTableProperties(
+                loadMetadataFromChecksumFileEnabledSession,
+                initialHandle,
+                ImmutableMap.of(CHANGE_DATA_FEED_ENABLED_PROPERTY, Optional.of((Object) true)));
+        deltaLakeMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+
+        // At this time, Trino does not write checksum files for Delta tables -- but for future-proofing, delete the
+        // checksum file for version 1 if it exists.
+        Files.deleteIfExists(checksumFilePath(tableLocation, 1));
+
+        transactionLogAccess.invalidateCache(tableMetadata.getTable(), Optional.of(initialHandle.getLocation()));
+        DeltaLakeMetadata reloadedMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        LocatedTableHandle reloadedHandle = reloadedMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        assertThat(reloadedHandle).isInstanceOf(DeltaLakeTableHandle.class);
+
+        // The new property is visible despite the lack of a checksum file for version 1, proving that we loaded metadata
+        // from the Delta log rather than from the checksum
+        DeltaLakeTableHandle tableHandle = (DeltaLakeTableHandle) reloadedHandle;
+        assertThat(tableHandle.getReadVersion()).isEqualTo(1);
+        assertThat(tableHandle.getMetadataEntry().getConfiguration())
+                .containsEntry(DELTA_CHANGE_DATA_FEED_ENABLED_PROPERTY, "true");
+        reloadedMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+    }
+
+    @Test
+    public void testGetTableHandleReturnsCorruptedHandleForMalformedChecksumWhenEnabled()
+            throws Exception
+    {
+        ConnectorSession loadMetadataFromChecksumFileEnabledSession = loadMetadataFromChecksumFileSession(true);
+        DeltaLakeMetadata deltaLakeMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        ConnectorTableMetadata tableMetadata = newTableMetadata(
+                ImmutableList.of(BIGINT_COLUMN_1, BIGINT_COLUMN_2),
+                ImmutableList.of());
+        deltaLakeMetadata.createTable(loadMetadataFromChecksumFileEnabledSession, tableMetadata, FAIL);
+        DeltaLakeTableHandle initialHandle = (DeltaLakeTableHandle) deltaLakeMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        String tableLocation = initialHandle.getLocation();
+        deltaLakeMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+
+        // Malformed checksum file
+        writeChecksumFile(tableLocation, 0, "{");
+
+        // With checksum metadata enabled, an invalid checksum file is treated as a hard error
+        DeltaLakeMetadata checksumMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileEnabledSession.getIdentity());
+        LocatedTableHandle checksumHandle = checksumMetadata.getTableHandle(loadMetadataFromChecksumFileEnabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty());
+        assertThat(checksumHandle).isInstanceOf(CorruptedDeltaLakeTableHandle.class);
+        assertThat(((CorruptedDeltaLakeTableHandle) checksumHandle).originalException())
+                .isInstanceOfSatisfying(TrinoException.class, exception ->
+                        assertThat(exception.getErrorCode()).isEqualTo(DELTA_LAKE_INVALID_SCHEMA.toErrorCode()));
+        checksumMetadata.cleanupQuery(loadMetadataFromChecksumFileEnabledSession);
+
+        // With checksum metadata disabled, the invalid checksum file goes unnoticed, and the table is loaded successfully
+        // from the Delta log alone
+        ConnectorSession loadMetadataFromChecksumFileDisabledSession = loadMetadataFromChecksumFileSession(false);
+        DeltaLakeMetadata transactionLogMetadata = deltaLakeMetadataFactory.create(loadMetadataFromChecksumFileDisabledSession.getIdentity());
+        assertThat(transactionLogMetadata.getTableHandle(loadMetadataFromChecksumFileDisabledSession, tableMetadata.getTable(), Optional.empty(), Optional.empty()))
+                .isInstanceOf(DeltaLakeTableHandle.class);
+        transactionLogMetadata.cleanupQuery(loadMetadataFromChecksumFileDisabledSession);
+    }
+
+    private static ConnectorSession loadMetadataFromChecksumFileSession(boolean enabled)
+    {
+        return TestingConnectorSession.builder()
+                .setPropertyMetadata(new DeltaLakeSessionProperties(new DeltaLakeConfig(), new ParquetReaderConfig(), new ParquetWriterConfig()).getSessionProperties())
+                .setPropertyValues(ImmutableMap.of("load_metadata_from_checksum_file", enabled))
+                .build();
+    }
+
+    private static void writeChecksumFile(String tableLocation, long version, String contents)
+            throws IOException
+    {
+        Files.writeString(checksumFilePath(tableLocation, version), contents);
+    }
+
+    private static Path checksumFilePath(String tableLocation, long version)
+    {
+        return Path.of(tableLocation).resolve("_delta_log").resolve("%020d.crc".formatted(version));
     }
 
     private static DeltaLakeTableHandle createDeltaLakeTableHandle(Set<DeltaLakeColumnHandle> projectedColumns, Set<DeltaLakeColumnHandle> constrainedColumns)

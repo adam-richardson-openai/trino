@@ -21,6 +21,8 @@ import dev.failsafe.Failsafe;
 import dev.failsafe.RetryPolicy;
 import io.airlift.json.ObjectMapperProvider;
 import io.airlift.log.Logger;
+import io.trino.filesystem.FileEntry;
+import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
 import io.trino.filesystem.TrinoInputFile;
@@ -51,11 +53,15 @@ import java.time.format.SignStyle;
 import java.time.temporal.ChronoField;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.google.common.base.Verify.verify;
 import static com.google.common.math.LongMath.divide;
 import static io.airlift.slice.Slices.utf8Slice;
+import static io.trino.plugin.deltalake.DeltaLakeErrorCode.DELTA_LAKE_INVALID_SCHEMA;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogUtil.getTransactionLogDir;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogUtil.getTransactionLogJsonEntryPath;
 import static io.trino.spi.StandardErrorCode.GENERIC_INTERNAL_ERROR;
@@ -99,6 +105,8 @@ public final class TransactionLogParser
     public static final long START_OF_MODERN_ERA_EPOCH_MICROS = LocalDateTime.of(START_OF_MODERN_ERA_DATE, LocalTime.MIN).toEpochSecond(UTC) * MICROSECONDS_PER_SECOND;
 
     public static final String LAST_CHECKPOINT_FILENAME = "_last_checkpoint";
+
+    private static final Pattern COMMIT_FILE_PATTERN = Pattern.compile("^(\\d{20})\\.json$");
 
     private TransactionLogParser() {}
 
@@ -303,6 +311,83 @@ public final class TransactionLogParser
                 return version;
             }
             version++;
+        }
+    }
+
+    public static OptionalLong getLatestCommitVersion(TrinoFileSystem fileSystem, String tableLocation, Optional<Long> startVersion, Optional<Long> endVersion)
+            throws IOException
+    {
+        long latestCommitVersion = -1;
+        FileIterator files = fileSystem.listFiles(Location.of(getTransactionLogDir(tableLocation)));
+        while (files.hasNext()) {
+            FileEntry file = files.next();
+            OptionalLong maybeCommitVersion = extractCommitVersion(file.location().fileName());
+            if (maybeCommitVersion.isEmpty()) {
+                continue;
+            }
+
+            long commitVersion = maybeCommitVersion.getAsLong();
+            if (startVersion.isPresent() && commitVersion < startVersion.get()) {
+                continue;
+            }
+            if (endVersion.isPresent() && commitVersion > endVersion.get()) {
+                continue;
+            }
+
+            if (commitVersion > latestCommitVersion) {
+                latestCommitVersion = commitVersion;
+            }
+        }
+
+        if (latestCommitVersion == -1) {
+            return OptionalLong.empty();
+        }
+
+        return OptionalLong.of(latestCommitVersion);
+    }
+
+    private static OptionalLong extractCommitVersion(String fileName)
+    {
+        Matcher matcher = COMMIT_FILE_PATTERN.matcher(fileName);
+        if (!matcher.matches()) {
+            return OptionalLong.empty();
+        }
+
+        return OptionalLong.of(parseLong(matcher.group(1)));
+    }
+
+    // Note: readVersionChecksumFile returns Optional.empty() on any IO error when reading the version checksum file.
+    // We would ideally return empty only for nonexistent checksum files, but this can't be distinguished reliably from a
+    // generic IO error across all filesystems
+    public static Optional<DeltaLakeVersionChecksum> readVersionChecksumFile(TrinoFileSystem fileSystem, String tableLocation, long version)
+    {
+        Location checksumPath = Location.of(getTransactionLogDir(tableLocation)).appendPath("%020d.crc".formatted(version));
+        TrinoInputFile inputFile = fileSystem.newInputFile(checksumPath);
+        try (InputStream checksumInput = inputFile.newStream()) {
+            return Optional.of(JsonUtils.parseJson(OBJECT_MAPPER, checksumInput, DeltaLakeVersionChecksum.class));
+        }
+        catch (IllegalArgumentException e) {
+            // Note: JsonUtils throws IllegalArgumentException for malformed content that parses but violates strict
+            // JSON shape checks (e.g. trailing content after the JSON object). Treat this as a hard failure (the Delta
+            // table might be corrupted)
+            throw new TrinoException(
+                    DELTA_LAKE_INVALID_SCHEMA,
+                    format("Unable to parse version checksum file for table %s, version %d", tableLocation, version),
+                    e);
+        }
+        catch (IOException | UncheckedIOException e) {
+            // Note: JsonUtils wraps JSON parse errors into UncheckedIOException. Treat parse errors as a hard failure (the
+            // Delta table might be corrupted)
+            if (e.getCause() instanceof JsonParseException || e.getCause() instanceof JsonMappingException) {
+                throw new TrinoException(
+                        DELTA_LAKE_INVALID_SCHEMA,
+                        format("Unable to parse version checksum file for table %s, version %d", tableLocation, version),
+                        e);
+            }
+
+            // Other IO exception; assume that the checksum file cannot be found. We'd ideally catch FileNotFoundException
+            // in particular to catch a nonexistent checksum file, but some file system implementations throw other exceptions
+            return Optional.empty();
         }
     }
 }
