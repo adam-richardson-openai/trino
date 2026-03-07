@@ -41,6 +41,7 @@ import io.trino.plugin.deltalake.ForDeltaLakeMetadata;
 import io.trino.plugin.deltalake.metastore.DeltaMetastoreTable;
 import io.trino.plugin.deltalake.metastore.VendedCredentialsHandle;
 import io.trino.plugin.deltalake.transactionlog.TableSnapshot.MetadataAndProtocolEntry;
+import io.trino.plugin.deltalake.transactionlog.TransactionLogParser.CommitVersionChecksumFileInfo;
 import io.trino.plugin.deltalake.transactionlog.checkpoint.CheckpointEntryIterator;
 import io.trino.plugin.deltalake.transactionlog.checkpoint.CheckpointSchemaManager;
 import io.trino.plugin.deltalake.transactionlog.checkpoint.LastCheckpoint;
@@ -90,8 +91,11 @@ import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static io.airlift.slice.SizeOf.estimatedSizeOf;
 import static io.airlift.slice.SizeOf.instanceSize;
 import static io.trino.cache.CacheUtils.invalidateAllIf;
+import static io.trino.cache.CacheUtils.uncheckedCacheGet;
 import static io.trino.plugin.deltalake.DeltaLakeErrorCode.DELTA_LAKE_INVALID_SCHEMA;
+import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.findLatestCommitVersionChecksumFileInfo;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.readLastCheckpoint;
+import static io.trino.plugin.deltalake.transactionlog.TransactionLogParser.readVersionChecksumFile;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogUtil.getTransactionLogDir;
 import static io.trino.plugin.deltalake.transactionlog.TransactionLogUtil.getTransactionLogJsonEntryPath;
 import static io.trino.plugin.deltalake.transactionlog.checkpoint.CheckpointEntryIterator.EntryType.ADD;
@@ -121,6 +125,25 @@ public class TransactionLogAccess
     private final TransactionLogReaderFactory transactionLogReaderFactory;
 
     private final Cache<TableLocation, TableSnapshot> tableSnapshots;
+
+    public record DeltaLakeChecksumWithVersion(long version, DeltaLakeVersionChecksum versionChecksum)
+    {
+        private static final int INSTANCE_SIZE = instanceSize(DeltaLakeChecksumWithVersion.class);
+
+        public DeltaLakeChecksumWithVersion
+        {
+            requireNonNull(versionChecksum, "versionChecksum is null");
+        }
+
+        long getRetainedSizeInBytes()
+        {
+            return INSTANCE_SIZE +
+                    Long.BYTES +
+                    versionChecksum.getRetainedSizeInBytes();
+        }
+    }
+
+    private final Cache<TableLocation, DeltaLakeChecksumWithVersion> versionChecksums;
 
     @Inject
     public TransactionLogAccess(
@@ -152,6 +175,14 @@ public class TransactionLogAccess
                 .shareNothingWhenDisabled()
                 .recordStats()
                 .build();
+
+        versionChecksums = EvictableCacheBuilder.newBuilder()
+                .weigher((Weigher<TableLocation, DeltaLakeChecksumWithVersion>) (key, value) -> Ints.saturatedCast(key.getRetainedSizeInBytes() + value.getRetainedSizeInBytes()))
+                .maximumWeight(deltaLakeConfig.getMetadataChecksumCacheMaxRetainedSize().toBytes())
+                .expireAfterWrite(deltaLakeConfig.getMetadataChecksumCacheTtl().toMillis(), TimeUnit.MILLISECONDS)
+                .shareNothingWhenDisabled()
+                .recordStats()
+                .build();
     }
 
     @Managed
@@ -159,6 +190,13 @@ public class TransactionLogAccess
     public CacheStatsMBean getMetadataCacheStats()
     {
         return new CacheStatsMBean(tableSnapshots);
+    }
+
+    @Managed
+    @Nested
+    public CacheStatsMBean getVersionChecksumCacheStats()
+    {
+        return new CacheStatsMBean(versionChecksums);
     }
 
     public TableSnapshot loadSnapshot(ConnectorSession session, DeltaMetastoreTable table, Optional<Long> endVersion)
@@ -231,6 +269,77 @@ public class TransactionLogAccess
             }
         }
         return snapshot;
+    }
+
+    public Optional<DeltaLakeChecksumWithVersion> loadVersionChecksum(TrinoFileSystem fileSystem, SchemaTableName table, String tableLocation, Optional<Long> version)
+            throws IOException
+    {
+        TableLocation cacheKey = new TableLocation(table, tableLocation);
+        DeltaLakeChecksumWithVersion cachedVersionChecksum = versionChecksums.getIfPresent(cacheKey);
+
+        if (version.isPresent()) {
+            long targetVersion = version.orElseThrow();
+            if (cachedVersionChecksum != null && cachedVersionChecksum.version() == targetVersion) {
+                return Optional.of(cachedVersionChecksum);
+            }
+
+            Optional<DeltaLakeVersionChecksum> versionChecksum = readVersionChecksumFile(fileSystem, tableLocation, targetVersion);
+            return versionChecksum.map(checksum -> new DeltaLakeChecksumWithVersion(targetVersion, checksum));
+        }
+
+        if (cachedVersionChecksum != null) {
+            Location nextCommitPath = getTransactionLogJsonEntryPath(getTransactionLogDir(tableLocation), cachedVersionChecksum.version() + 1);
+            if (!fileSystem.newInputFile(nextCommitPath).exists()) {
+                return Optional.of(cachedVersionChecksum);
+            }
+
+            versionChecksums.invalidate(cacheKey);
+        }
+
+        Optional<DeltaLakeChecksumWithVersion> latestVersionChecksum = loadLatestVersionChecksum(fileSystem, table, tableLocation);
+
+        if (latestVersionChecksum.isPresent()) {
+            DeltaLakeChecksumWithVersion versionChecksum = latestVersionChecksum.orElseThrow();
+            cachedVersionChecksum = uncheckedCacheGet(versionChecksums, cacheKey, () -> versionChecksum);
+            if (versionChecksum.version() > cachedVersionChecksum.version()) {
+                versionChecksums.asMap().replace(cacheKey, cachedVersionChecksum, versionChecksum);
+            }
+            else {
+                latestVersionChecksum = Optional.of(cachedVersionChecksum);
+            }
+        }
+
+        return latestVersionChecksum;
+    }
+
+    private Optional<DeltaLakeChecksumWithVersion> loadLatestVersionChecksum(
+            TrinoFileSystem fileSystem,
+            SchemaTableName table,
+            String tableLocation)
+            throws IOException
+    {
+        Optional<Long> startVersion = readLastCheckpoint(fileSystem, tableLocation).map(lastCheckpoint -> lastCheckpoint.version() - 1);
+
+        Optional<CommitVersionChecksumFileInfo> checksumFileInfo =
+                findLatestCommitVersionChecksumFileInfo(fileSystem, tableLocation, startVersion, Optional.empty());
+
+        if (checksumFileInfo.isEmpty()) {
+            throw new TrinoException(DELTA_LAKE_INVALID_SCHEMA, "Metadata not found in transaction log for " + table);
+        }
+
+        CommitVersionChecksumFileInfo info = checksumFileInfo.orElseThrow();
+        if (!info.hasVersionChecksumFile()) {
+            return Optional.empty();
+        }
+
+        long latestCommitVersion = info.version();
+
+        Optional<DeltaLakeVersionChecksum> versionChecksum = readVersionChecksumFile(fileSystem, tableLocation, latestCommitVersion);
+        if (versionChecksum.isEmpty()) {
+            return Optional.empty();
+        }
+
+        return Optional.of(new DeltaLakeChecksumWithVersion(latestCommitVersion, versionChecksum.orElseThrow()));
     }
 
     private TableSnapshot loadSnapshotForTimeTravel(ConnectorSession session, TransactionLogReader transactionLogReader, TrinoFileSystem fileSystem, SchemaTableName table, String tableLocation, long endVersion)
@@ -312,6 +421,7 @@ public class TransactionLogAccess
     public void flushCache()
     {
         tableSnapshots.invalidateAll();
+        versionChecksums.invalidateAll();
     }
 
     public void invalidateCache(SchemaTableName schemaTableName, Optional<String> tableLocation)
@@ -320,8 +430,10 @@ public class TransactionLogAccess
         // Invalidate by location in case one table (location) unregistered and re-register under different name
         tableLocation.ifPresent(location -> {
             invalidateAllIf(tableSnapshots, cacheKey -> cacheKey.location().equals(location));
+            invalidateAllIf(versionChecksums, cacheKey -> cacheKey.location().equals(location));
         });
         invalidateAllIf(tableSnapshots, cacheKey -> cacheKey.tableName().equals(schemaTableName));
+        invalidateAllIf(versionChecksums, cacheKey -> cacheKey.tableName().equals(schemaTableName));
     }
 
     public MetadataEntry getMetadataEntry(ConnectorSession session, TrinoFileSystem fileSystem, TableSnapshot tableSnapshot)

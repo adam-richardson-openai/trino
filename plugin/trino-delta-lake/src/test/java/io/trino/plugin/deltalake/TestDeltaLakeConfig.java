@@ -42,6 +42,8 @@ public class TestDeltaLakeConfig
         assertRecordedDefaults(recordDefaults(DeltaLakeConfig.class)
                 .setMetadataCacheTtl(new Duration(30, TimeUnit.MINUTES))
                 .setMetadataCacheMaxRetainedSize(DeltaLakeConfig.DEFAULT_METADATA_CACHE_MAX_RETAINED_SIZE)
+                .setMetadataChecksumCacheTtl(new Duration(30, TimeUnit.MINUTES))
+                .setMetadataChecksumCacheMaxRetainedSize(DataSize.of(32, MEGABYTE))
                 .setTransactionLogMaxCachedFileSize(DeltaLakeConfig.DEFAULT_TRANSACTION_LOG_MAX_CACHED_SIZE)
                 .setDomainCompactionThreshold(1000)
                 .setMaxSplitsPerSecond(Integer.MAX_VALUE)
@@ -75,7 +77,8 @@ public class TestDeltaLakeConfig
                 .setDeletionVectorsEnabled(false)
                 .setDeltaLogFileSystemCacheDisabled(false)
                 .setMetadataParallelism(8)
-                .setCheckpointProcessingParallelism(4));
+                .setCheckpointProcessingParallelism(4)
+                .setLoadMetadataFromChecksumFile(false));
     }
 
     @Test
@@ -84,6 +87,8 @@ public class TestDeltaLakeConfig
         Map<String, String> properties = ImmutableMap.<String, String>builder()
                 .put("delta.metadata.cache-ttl", "10m")
                 .put("delta.metadata.cache-max-retained-size", "1GB")
+                .put("delta.metadata.checksum.cache-ttl", "20m")
+                .put("delta.metadata.checksum.cache-max-retained-size", "256MB")
                 .put("delta.transaction-log.max-cached-file-size", "1MB")
                 .put("delta.domain-compaction-threshold", "500")
                 .put("delta.max-outstanding-splits", "200")
@@ -118,11 +123,14 @@ public class TestDeltaLakeConfig
                 .put("delta.fs.cache.disable-transaction-log-caching", "true")
                 .put("delta.metadata.parallelism", "10")
                 .put("delta.checkpoint-processing.parallelism", "8")
+                .put("delta.load-metadata-from-checksum-file", "true")
                 .buildOrThrow();
 
         DeltaLakeConfig expected = new DeltaLakeConfig()
                 .setMetadataCacheTtl(new Duration(10, TimeUnit.MINUTES))
                 .setMetadataCacheMaxRetainedSize(DataSize.of(1, GIGABYTE))
+                .setMetadataChecksumCacheTtl(new Duration(20, TimeUnit.MINUTES))
+                .setMetadataChecksumCacheMaxRetainedSize(DataSize.of(256, MEGABYTE))
                 .setTransactionLogMaxCachedFileSize(DataSize.of(1, MEGABYTE))
                 .setDomainCompactionThreshold(500)
                 .setMaxOutstandingSplits(200)
@@ -156,7 +164,8 @@ public class TestDeltaLakeConfig
                 .setDeletionVectorsEnabled(true)
                 .setDeltaLogFileSystemCacheDisabled(true)
                 .setMetadataParallelism(10)
-                .setCheckpointProcessingParallelism(8);
+                .setCheckpointProcessingParallelism(8)
+                .setLoadMetadataFromChecksumFile(true);
 
         assertFullMapping(properties, expected);
     }

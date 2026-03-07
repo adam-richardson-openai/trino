@@ -90,6 +90,13 @@ values. Typical usage does not require you to configure them.
     specified in [](prop-type-data-size) values such as `64MB`. Default is
     calculated to 5% of the maximum memory allocated to the JVM.
   - 
+* - `delta.metadata.checksum.cache-ttl`
+  - Caching duration for Delta table checksum metadata.
+  - `30m`
+* - `delta.metadata.checksum.cache-max-retained-size`
+  - Maximum retained size of Delta table checksum metadata stored in cache.
+    Must be specified in [](prop-type-data-size) values such as `64MB`.
+  - `32MB`
 * - `delta.transaction-log.max-cached-file-size`
   - Maximum size of delta transaction log file that will be cached in memory
     for the table metadata cache.
@@ -200,6 +207,11 @@ values. Typical usage does not require you to configure them.
   - Number of threads used for retrieving checkpoint files of each table. Currently, only 
     retrievals of V2 Checkpoint's sidecar files are parallelized.
   - `4`
+* - `delta.load-metadata-from-checksum-file`
+  - Use the Delta checksum metadata file (if available) to retrieve table
+    metadata and protocol entries instead of scanning the transaction log. The
+    equivalent catalog session property is `load_metadata_from_checksum_file`.
+  - `false`
 :::
 
 ### Catalog session properties
@@ -233,6 +245,10 @@ The following table describes {ref}`catalog session properties
   - Read only projected fields from row columns while performing `SELECT`
     queries.
   - `true`
+* - `load_metadata_from_checksum_file`
+  - Use the Delta checksum metadata file (if available) to retrieve table
+    metadata and protocol entries instead of scanning the transaction log.
+  - `false`
 :::
 
 (delta-lake-fte-support)=
