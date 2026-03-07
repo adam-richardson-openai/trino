@@ -425,9 +425,8 @@ public final class TransactionLogParser
         catch (IOException | UncheckedIOException e) {
             List<Throwable> causalChain = Throwables.getCausalChain(e);
 
-            // We generally expect that readVersionChecksumFile is only called for validation commit versions in the Delta
-            // table. However, per the Delta spec, a valid commit need not have a corresponding version checksum file. This
-            // is relevant for the time travel case in DeltaLakeMetadata.loadDescriptor
+            // We generally expect that readVersionChecksumFile is only called for validated commit versions in the Delta
+            // table. However, per the Delta spec, a valid commit need not have a corresponding version checksum file
             if (causalChain.stream().anyMatch(FileNotFoundException.class::isInstance)) {
                 return Optional.empty();
             }

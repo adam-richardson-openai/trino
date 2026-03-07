@@ -15,6 +15,9 @@ package io.trino.plugin.deltalake.transactionlog;
 
 import jakarta.annotation.Nullable;
 
+import static io.airlift.slice.SizeOf.SIZE_OF_LONG;
+import static io.airlift.slice.SizeOf.instanceSize;
+
 // Ref. https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 // At this time, we support all fields of the version checksum file that are required per the Delta spec. However, we treat
 // all fields as optional to be defensive against non-compliant Delta Lake implementations
@@ -26,4 +29,16 @@ public record DeltaLakeVersionChecksum(
         @Nullable MetadataEntry metadata,
         @Nullable ProtocolEntry protocol)
 {
+    private static final int INSTANCE_SIZE = instanceSize(DeltaLakeVersionChecksum.class);
+
+    public long getRetainedSizeInBytes()
+    {
+        return INSTANCE_SIZE
+                + (tableSizeBytes == null ? 0 : SIZE_OF_LONG)
+                + (numFiles == null ? 0 : SIZE_OF_LONG)
+                + (numMetadata == null ? 0 : SIZE_OF_LONG)
+                + (numProtocol == null ? 0 : SIZE_OF_LONG)
+                + (metadata == null ? 0 : metadata.getRetainedSizeInBytes())
+                + (protocol == null ? 0 : protocol.getRetainedSizeInBytes());
+    }
 }

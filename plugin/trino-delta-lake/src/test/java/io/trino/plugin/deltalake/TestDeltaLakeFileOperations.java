@@ -1182,8 +1182,9 @@ public class TestDeltaLakeFileOperations
 
         assertFileSystemAccesses(session, "DESCRIBE " + tableName,
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", "InputFile.newStream"), 2)
-                        .addCopies(new FileOperation(CHECKSUM, "00000000000000000001.crc", "InputFile.newStream"), 2)
+                        .add(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", "InputFile.newStream"))
+                        .add(new FileOperation(CHECKSUM, "00000000000000000001.crc", "InputFile.newStream"))
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", "InputFile.exists"))
                         .build());
 
         assertUpdate(session, "DROP TABLE " + tableName);
@@ -1258,8 +1259,9 @@ public class TestDeltaLakeFileOperations
 
         assertFileSystemAccesses(session, "DESCRIBE " + tableName,
                 ImmutableMultiset.<FileOperation>builder()
-                        .addCopies(new FileOperation(CHECKSUM, "00000000000000000001.crc", "InputFile.newStream"), 2)
-                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", "InputFile.newStream"), 3)
+                        .add(new FileOperation(CHECKSUM, "00000000000000000001.crc", "InputFile.newStream"))
+                        .addCopies(new FileOperation(LAST_CHECKPOINT, "_last_checkpoint", "InputFile.newStream"), 2)
+                        .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", "InputFile.exists"))
                         .add(new FileOperation(CHECKPOINT, "00000000000000000001.checkpoint.parquet", "InputFile.length"))
                         .add(new FileOperation(CHECKPOINT, "00000000000000000001.checkpoint.parquet", "InputFile.newInput"))
                         .add(new FileOperation(TRANSACTION_LOG_JSON, "00000000000000000002.json", "InputFile.length"))

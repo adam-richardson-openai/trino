@@ -90,6 +90,13 @@ values. Typical usage does not require you to configure them.
     specified in [](prop-type-data-size) values such as `64MB`. Default is
     calculated to 5% of the maximum memory allocated to the JVM.
   - 
+* - `delta.metadata.checksum.cache-ttl`
+  - Caching duration for Delta table checksum metadata.
+  - `30m`
+* - `delta.metadata.checksum.cache-max-retained-size`
+  - Maximum retained size of Delta table checksum metadata stored in cache.
+    Must be specified in [](prop-type-data-size) values such as `64MB`.
+  - `32MB`
 * - `delta.transaction-log.max-cached-file-size`
   - Maximum size of delta transaction log file that will be cached in memory
     for the table metadata cache.

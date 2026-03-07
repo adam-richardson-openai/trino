@@ -55,12 +55,16 @@ public class DeltaLakeConfig
     public static final String EXTENDED_STATISTICS_ENABLED = "delta.extended-statistics.enabled";
     public static final String VACUUM_MIN_RETENTION = "delta.vacuum.min-retention";
     public static final DataSize DEFAULT_TRANSACTION_LOG_MAX_CACHED_SIZE = DataSize.of(16, MEGABYTE);
+    public static final Duration DEFAULT_METADATA_CHECKSUM_CACHE_TTL = new Duration(30, TimeUnit.MINUTES);
+    public static final DataSize DEFAULT_METADATA_CHECKSUM_CACHE_MAX_RETAINED_SIZE = DataSize.of(32, MEGABYTE);
 
     @VisibleForTesting
     static final DataSize DEFAULT_METADATA_CACHE_MAX_RETAINED_SIZE = DataSize.succinctBytes(Math.floorDiv(Runtime.getRuntime().maxMemory(), 20L));
 
     private Duration metadataCacheTtl = new Duration(30, TimeUnit.MINUTES);
     private DataSize metadataCacheMaxRetainedSize = DEFAULT_METADATA_CACHE_MAX_RETAINED_SIZE;
+    private Duration metadataChecksumCacheTtl = DEFAULT_METADATA_CHECKSUM_CACHE_TTL;
+    private DataSize metadataChecksumCacheMaxRetainedSize = DEFAULT_METADATA_CHECKSUM_CACHE_MAX_RETAINED_SIZE;
     private DataSize transactionLogMaxCachedFileSize = DEFAULT_TRANSACTION_LOG_MAX_CACHED_SIZE;
     private int domainCompactionThreshold = 1000;
     private int maxOutstandingSplits = 1_000;
@@ -120,6 +124,32 @@ public class DeltaLakeConfig
     public DeltaLakeConfig setMetadataCacheMaxRetainedSize(DataSize metadataCacheMaxRetainedSize)
     {
         this.metadataCacheMaxRetainedSize = metadataCacheMaxRetainedSize;
+        return this;
+    }
+
+    public Duration getMetadataChecksumCacheTtl()
+    {
+        return metadataChecksumCacheTtl;
+    }
+
+    @Config("delta.metadata.checksum.cache-ttl")
+    @ConfigDescription("Caching duration for Delta table checksum metadata")
+    public DeltaLakeConfig setMetadataChecksumCacheTtl(Duration metadataChecksumCacheTtl)
+    {
+        this.metadataChecksumCacheTtl = metadataChecksumCacheTtl;
+        return this;
+    }
+
+    public DataSize getMetadataChecksumCacheMaxRetainedSize()
+    {
+        return metadataChecksumCacheMaxRetainedSize;
+    }
+
+    @Config("delta.metadata.checksum.cache-max-retained-size")
+    @ConfigDescription("Maximum retained size of Delta table checksum metadata stored in cache")
+    public DeltaLakeConfig setMetadataChecksumCacheMaxRetainedSize(DataSize metadataChecksumCacheMaxRetainedSize)
+    {
+        this.metadataChecksumCacheMaxRetainedSize = metadataChecksumCacheMaxRetainedSize;
         return this;
     }
 
